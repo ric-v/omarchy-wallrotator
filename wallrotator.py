@@ -28,7 +28,9 @@ Commands (every output is one JSON line on stdout):
   wallrotator.py apply <path>
 """
 
+import contextlib
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -501,6 +503,34 @@ def save_state(state):
     write_private(STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False))
 
 
+@contextlib.contextmanager
+def state_lock():
+    """Serialize state read-modify-write cycles across processes."""
+    prepare_storage()
+    fd = os.open(STATE_DIR / "state.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)  # closing releases the flock
+
+
+def commit_fetch(fetched):
+    """Persist a finished fetch's history/cursor onto the latest saved state.
+
+    A fetch can run for a long time; Stop/Off (running, scheduleMinutes) or
+    other preferences may have been saved meanwhile by another widget instance,
+    so reload under the lock and only merge what the fetch owns.
+    """
+    with state_lock():
+        latest = load_state()
+        latest["history"] = fetched["history"]
+        latest["historyIndex"] = fetched["historyIndex"]
+        latest["tagCursor"] = fetched["tagCursor"]
+        save_state(latest)
+        return latest
+
+
 def status_response(state=None):
     if state is None:
         state = load_state()
@@ -841,8 +871,7 @@ def fetch_and_apply_new(state, force_shuffle=False):
     state["history"] = [entry] + [h for h in state["history"] if h["path"] != str(dest)]
     state["history"] = state["history"][:MAX_HISTORY]
     state["historyIndex"] = 0
-    save_state(state)
-    return status_response(state)
+    return status_response(commit_fetch(state))
 
 
 # ------------------------------------------------------------------ commands
@@ -860,12 +889,13 @@ def cmd_set_mode(mode):
 
 
 def cmd_set_running(val_str):
-    state = load_state()
     want = str(val_str).lower() in ("1", "true", "yes", "on", "start")
-    state["running"] = want
-    if want and state["scheduleMinutes"] == 0:
-        state["scheduleMinutes"] = 30
-    save_state(state)
+    with state_lock():
+        state = load_state()
+        state["running"] = want
+        if want and state["scheduleMinutes"] == 0:
+            state["scheduleMinutes"] = 30
+        save_state(state)
     out(status_response(state))
 
 
@@ -876,10 +906,11 @@ def cmd_set_schedule(minutes_str):
         fail("usage")
     if m not in VALID_SCHEDULES:
         fail("usage")
-    state = load_state()
-    state["scheduleMinutes"] = m
-    state["running"] = m > 0
-    save_state(state)
+    with state_lock():
+        state = load_state()
+        state["scheduleMinutes"] = m
+        state["running"] = m > 0
+        save_state(state)
     out(status_response(state))
 
 

@@ -180,6 +180,29 @@ class StateAndCommandsTests(unittest.TestCase):
             next_res = self.run_json(wr.cmd_next)
             self.assertEqual(next_res["historyIndex"], 0)
 
+    def test_fetch_commit_preserves_stop_saved_during_fetch(self):
+        # Instance A starts a fetch holding a stale "running" schedule.
+        self.run_json(wr.cmd_set_schedule, "30")
+        stale = wr.load_state()
+        self.assertTrue(stale["running"])
+
+        # Instance B saves Stop, then Off, while A's fetch is in flight.
+        self.run_json(wr.cmd_set_running, "false")
+        self.run_json(wr.cmd_set_schedule, "0")
+
+        img = Path(self.tmp.name) / "x.jpg"
+        img.write_bytes(b"\xff\xd8\xff\xe0")
+        entry = {"id": "wallhaven-x", "path": str(img), "thumb": "", "title": "x",
+                 "mode": "wallhaven", "resolution": "1x1", "tag": "t", "timestamp": 1}
+        stale["history"] = [entry] + stale["history"]
+        stale["historyIndex"] = 0
+        wr.commit_fetch(stale)
+
+        saved = wr.load_state()
+        self.assertFalse(saved["running"])
+        self.assertEqual(saved["scheduleMinutes"], 0)
+        self.assertEqual(saved["history"][0]["id"], "wallhaven-x")
+
     def test_set_key_for_wallhaven_and_pixabay(self):
         with mock.patch.object(wr, "get_json", return_value={"data": []}), \
              mock.patch("sys.stdin", io.StringIO("wh_secret_token_1234567890\n")):
