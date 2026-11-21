@@ -37,6 +37,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -622,7 +623,6 @@ def download_image(url, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
         return
-    part = dest.with_name(dest.name + ".part")
     try:
         with _open(url) as r:
             ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
@@ -631,17 +631,19 @@ def download_image(url, dest):
             data = _read_limited(r, MAX_IMAGE)
         if not (data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n")):
             raise WRError("bad_type", "not JPEG/PNG")
-        write_private(part, data)
-        os.chmod(part, 0o644)
-        part.replace(dest)
+        with tempfile.TemporaryDirectory(prefix=".wallrotator-", dir=str(dest.parent)) as tmpdir:
+            part = Path(tmpdir) / "image.part"
+            part.write_bytes(data)
+            os.chmod(part, 0o644)
+            try:
+                os.link(part, dest)
+            except FileExistsError:
+                pass
     except WRError:
-        part.unlink(missing_ok=True)
         raise
     except urllib.error.URLError as e:
-        part.unlink(missing_ok=True)
         raise WRError("network", str(getattr(e, "reason", e)))
     except OSError as e:
-        part.unlink(missing_ok=True)
         raise WRError("io", str(e.strerror or e))
 
 
@@ -723,57 +725,57 @@ def download_video(url, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file() and dest.stat().st_size > 0:
         return
-    part = dest.with_name(dest.name + ".part")
     try:
-        with _open(url) as r:
-            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
-            if ctype and ctype not in ("video/mp4", "application/octet-stream", "binary/octet-stream"):
-                raise WRError("bad_type", ctype)
-            total = int(r.headers.get("Content-Length") or 0)
-            if total > MAX_VIDEO:
-                raise WRError("too_big")
-            done = 0
-            with open(part, "wb") as f:
-                while True:
-                    chunk = r.read(256 * 1024)
-                    if not chunk:
-                        break
-                    done += len(chunk)
-                    if done > MAX_VIDEO:
-                        raise WRError("too_big")
-                    f.write(chunk)
-        with open(part, "rb") as f:
-            head = f.read(12)
-        if head[4:8] != b"ftyp":
-            raise WRError("bad_type", "not MP4")
-        if shutil.which("ffmpeg"):
-            muted = dest.with_name(dest.stem + ".muted.mp4")
+        with tempfile.TemporaryDirectory(prefix=".wallrotator-", dir=str(dest.parent)) as tmpdir:
+            part = Path(tmpdir) / "download.mp4"
+            with _open(url) as r:
+                ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+                if ctype and ctype not in ("video/mp4", "application/octet-stream", "binary/octet-stream"):
+                    raise WRError("bad_type", ctype)
+                total = int(r.headers.get("Content-Length") or 0)
+                if total > MAX_VIDEO:
+                    raise WRError("too_big")
+                done = 0
+                with open(part, "wb") as f:
+                    while True:
+                        chunk = r.read(256 * 1024)
+                        if not chunk:
+                            break
+                        done += len(chunk)
+                        if done > MAX_VIDEO:
+                            raise WRError("too_big")
+                        f.write(chunk)
+            with open(part, "rb") as f:
+                head = f.read(12)
+            if head[4:8] != b"ftyp":
+                raise WRError("bad_type", "not MP4")
+            final_file = part
+            if shutil.which("ffmpeg"):
+                muted = Path(tmpdir) / "muted.mp4"
+                try:
+                    r = subprocess.run(
+                        [
+                            "ffmpeg", "-nostdin", "-loglevel", "error", "-y",
+                            "-protocol_whitelist", "file", "-i", str(part),
+                            "-c:v", "copy", "-an", str(muted),
+                        ],
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    if r.returncode == 0 and muted.is_file() and muted.stat().st_size > 0:
+                        final_file = muted
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            os.chmod(final_file, 0o644)
             try:
-                r = subprocess.run(
-                    [
-                        "ffmpeg", "-nostdin", "-loglevel", "error", "-y",
-                        "-protocol_whitelist", "file", "-i", str(part),
-                        "-c:v", "copy", "-an", str(muted),
-                    ],
-                    capture_output=True,
-                    timeout=30,
-                )
-                if r.returncode == 0 and muted.is_file() and muted.stat().st_size > 0:
-                    muted.replace(part)
-            except (OSError, subprocess.TimeoutExpired):
+                os.link(final_file, dest)
+            except FileExistsError:
                 pass
-            finally:
-                muted.unlink(missing_ok=True)
-        os.chmod(part, 0o644)
-        part.replace(dest)
     except WRError:
-        part.unlink(missing_ok=True)
         raise
     except urllib.error.URLError as e:
-        part.unlink(missing_ok=True)
         raise WRError("network", str(getattr(e, "reason", e)))
     except OSError as e:
-        part.unlink(missing_ok=True)
         raise WRError("io", str(e.strerror or e))
 
 

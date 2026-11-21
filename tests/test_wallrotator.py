@@ -195,6 +195,62 @@ class StateAndCommandsTests(unittest.TestCase):
             self.assertEqual(res["keySaved"], "pixabay")
             self.assertEqual((wr.STATE_DIR / "pixabay.key").stat().st_mode & 0o777, 0o600)
 
+    def test_download_image_preserves_theme_dir_permissions(self):
+        bg_dir = wr.BG_ROOT / "catppuccin"
+        bg_dir.mkdir(parents=True, exist_ok=True)
+        os.chmod(bg_dir, 0o755)
+        dest = bg_dir / "wallhaven-abc123.jpg"
+
+        class FakeResp:
+            headers = {"Content-Type": "image/jpeg"}
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self, n=-1): return b"\xff\xd8\xff\xe0" + b"0" * 32
+
+        with mock.patch.object(wr, "_open", return_value=FakeResp()):
+            wr.download_image("https://w.wallhaven.cc/full/ab/wallhaven-abc123.jpg", dest)
+
+        self.assertTrue(dest.is_file())
+        self.assertEqual(bg_dir.stat().st_mode & 0o777, 0o755)
+
+    def test_download_video_muting_does_not_overwrite_or_delete_existing_muted_file(self):
+        bg_dir = wr.BG_ROOT / "catppuccin"
+        bg_dir.mkdir(parents=True, exist_ok=True)
+        existing_muted = bg_dir / "pixabay-99-1080p.muted.mp4"
+        existing_muted.write_bytes(b"USER_OWNED_DATA")
+        dest = bg_dir / "pixabay-99-1080p.mp4"
+
+        class FakeVideoResp:
+            headers = {"Content-Type": "video/mp4", "Content-Length": "32"}
+            def __init__(self): self._done = False
+            def __enter__(self): return self
+            def __exit__(self, *a): pass
+            def read(self, n=-1):
+                if self._done: return b""
+                self._done = True
+                return b"\x00\x00\x00\x18ftypmp42" + b"0" * 20
+
+        def fake_ffmpeg(cmd, **kwargs):
+            out_path = Path(cmd[-1])
+            out_path.write_bytes(b"\x00\x00\x00\x18ftypmp42MUTED")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        with mock.patch.object(wr, "_open", return_value=FakeVideoResp()), \
+             mock.patch.object(wr.shutil, "which", return_value="/usr/bin/ffmpeg"), \
+             mock.patch.object(wr.subprocess, "run", side_effect=fake_ffmpeg):
+            wr.download_video("https://cdn.pixabay.com/v/99.mp4", dest)
+
+        self.assertTrue(dest.is_file())
+        self.assertTrue(existing_muted.is_file())
+        self.assertEqual(existing_muted.read_bytes(), b"USER_OWNED_DATA")
+
+    def test_qml_queues_schedule_changes_during_fetch(self):
+        qml = (ROOT / "Panel.qml").read_text()
+        self.assertIn("function queueCommand", qml)
+        self.assertIn("pendingSchedule", qml)
+        self.assertIn("pendingRunning", qml)
+        self.assertIn('root.queueCommand(["set-schedule", String(m)], "set-schedule")', qml)
+
     def test_catalog_error_codes_complete(self):
         en = json.loads((ROOT / "i18n/en.json").read_text())
         src = (ROOT / "wallrotator.py").read_text()

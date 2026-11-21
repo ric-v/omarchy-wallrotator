@@ -74,6 +74,10 @@ Panel {
   property bool busy: false
   property string errorCode: ""
   property string errorDetail: ""
+  property var pendingCommands: []
+  property string activeCmd: ""
+  property int pendingSchedule: -1
+  property int pendingRunning: -1
 
   readonly property bool activeModeHasKey: root.mode === "pixabay" ? root.hasPixabayKey : root.hasWallhavenKey
   readonly property string activeProviderLabel: root.mode === "pixabay" ? "Pixabay" : "Wallhaven"
@@ -101,7 +105,14 @@ Panel {
     return t.indexOf("%1") >= 0 ? t.arg(root.neutralizeMarkup(root.errorDetail)) : t
   }
 
-  function applyStatus(r) {
+  function hasQueuedCommand(cmdName) {
+    for (var i = 0; i < root.pendingCommands.length; i++) {
+      if (root.pendingCommands[i] && root.pendingCommands[i][0] === cmdName) return true
+    }
+    return false
+  }
+
+  function applyStatus(r, sourceCmd) {
     if (!r) return
     if (r.ok === false) {
       root.errorCode = String(r.code || "generic").replace(/[^a-z_]/g, "").substring(0, 40)
@@ -111,7 +122,19 @@ Panel {
     root.errorCode = ""
     root.errorDetail = ""
     if (r.mode === "wallhaven" || r.mode === "pixabay") root.mode = r.mode
-    if (r.running !== undefined) root.running = !!r.running
+
+    // Only accept running / scheduleMinutes from backend once any user-initiated
+    // schedule/running change has been persisted (never let a stale in-flight
+    // wallpaper fetch restore an old schedule or restart rotation).
+    if (sourceCmd === "set-schedule" && !root.hasQueuedCommand("set-schedule")) {
+      root.pendingSchedule = -1
+      if (!root.hasQueuedCommand("set-running")) root.pendingRunning = -1
+    } else if (sourceCmd === "set-running" && !root.hasQueuedCommand("set-running")) {
+      root.pendingRunning = -1
+      if (!root.hasQueuedCommand("set-schedule")) root.pendingSchedule = -1
+    }
+
+    if (r.running !== undefined && root.pendingRunning < 0) root.running = !!r.running
     if (r.currentPeriod === "morning" || r.currentPeriod === "noon" || r.currentPeriod === "evening" || r.currentPeriod === "night") {
       root.currentPeriod = r.currentPeriod
       if (!root.periodPickedByUser) root.selectedPeriod = r.currentPeriod
@@ -136,7 +159,7 @@ Panel {
       }
       root.periodColors = pc
     }
-    if (r.scheduleMinutes !== undefined) root.scheduleMinutes = Number(r.scheduleMinutes) || 0
+    if (r.scheduleMinutes !== undefined && root.pendingSchedule < 0) root.scheduleMinutes = Number(r.scheduleMinutes) || 0
     if (r.shuffle !== undefined) root.shuffle = !!r.shuffle
     if (Array.isArray(r.history)) {
       root.history = r.history.slice(0, 10).map(function(h) {
@@ -162,12 +185,32 @@ Panel {
     }
   }
 
-  function runCommand(args) {
-    if (cmdProc.running) return
+  function startCommand(args) {
     root.busy = true
     root.errorCode = ""
+    root.activeCmd = String((args && args[0]) || "")
     cmdProc.command = ["python3", "-I", root.script].concat(args)
     cmdProc.running = true
+  }
+
+  function runCommand(args) {
+    if (cmdProc.running) return
+    root.startCommand(args)
+  }
+
+  function queueCommand(args, dedupeCmd) {
+    if (!cmdProc.running) {
+      root.startCommand(args)
+      return
+    }
+    var nextQueue = []
+    for (var i = 0; i < root.pendingCommands.length; i++) {
+      var item = root.pendingCommands[i]
+      if (dedupeCmd && item && item[0] === dedupeCmd) continue
+      nextQueue.push(item)
+    }
+    nextQueue.push(args)
+    root.pendingCommands = nextQueue
   }
 
   function refresh() {
@@ -181,12 +224,18 @@ Panel {
     if (m === root.mode) return
     root.mode = m
     root.keySavedProvider = ""
-    root.runCommand(["set-mode", m])
+    root.queueCommand(["set-mode", m], "set-mode")
   }
 
   function setRunning(want) {
-    root.running = !!want
-    root.runCommand(["set-running", want ? "true" : "false"])
+    var w = !!want
+    root.running = w
+    root.pendingRunning = w ? 1 : 0
+    if (w && root.scheduleMinutes === 0) {
+      root.scheduleMinutes = 30
+      root.pendingSchedule = 30
+    }
+    root.queueCommand(["set-running", w ? "true" : "false"], "set-running")
   }
 
   function toggleRunning() {
@@ -197,7 +246,9 @@ Panel {
     var m = Number(mins) || 0
     root.scheduleMinutes = m
     root.running = m > 0
-    root.runCommand(["set-schedule", String(m)])
+    root.pendingSchedule = m
+    root.pendingRunning = m > 0 ? 1 : 0
+    root.queueCommand(["set-schedule", String(m)], "set-schedule")
   }
 
   function next() {
@@ -268,9 +319,13 @@ Panel {
   Timer {
     id: scheduleTimer
     interval: Math.max(1, root.scheduleMinutes) * 60 * 1000
-    running: root.running && root.scheduleMinutes > 0
+    running: root.running && root.scheduleMinutes > 0 && root.pendingRunning !== 0 && root.pendingSchedule !== 0
     repeat: true
-    onTriggered: root.next()
+    onTriggered: {
+      if (root.running && root.scheduleMinutes > 0 && root.pendingRunning !== 0 && root.pendingSchedule !== 0) {
+        root.next()
+      }
+    }
   }
 
   Timer {
@@ -285,7 +340,7 @@ Panel {
     id: statusProc
     stdout: SplitParser {
       onRead: function(line) {
-        try { root.applyStatus(JSON.parse(line)) } catch (e) {}
+        try { root.applyStatus(JSON.parse(line), "status") } catch (e) {}
       }
     }
   }
@@ -294,11 +349,18 @@ Panel {
     id: cmdProc
     stdout: SplitParser {
       onRead: function(line) {
-        try { root.applyStatus(JSON.parse(line)) } catch (e) {}
+        try { root.applyStatus(JSON.parse(line), root.activeCmd) } catch (e) {}
       }
     }
     onExited: {
-      root.busy = false
+      if (root.pendingCommands.length > 0) {
+        var nextArgs = root.pendingCommands[0]
+        root.pendingCommands = root.pendingCommands.slice(1)
+        root.startCommand(nextArgs)
+      } else {
+        root.activeCmd = ""
+        root.busy = false
+      }
     }
   }
 
@@ -306,7 +368,7 @@ Panel {
     id: keyProc
     stdout: SplitParser {
       onRead: function(line) {
-        try { root.applyStatus(JSON.parse(line)) } catch (e) {}
+        try { root.applyStatus(JSON.parse(line), "set-key") } catch (e) {}
       }
     }
     onExited: {
@@ -402,7 +464,6 @@ Panel {
               foreground: root.foreground
               fontFamily: root.fontFamily
               fontSize: Style.font.bodySmall
-              enabled: !root.busy
               onClicked: root.toggleRunning()
             }
           }
