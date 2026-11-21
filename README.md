@@ -2,6 +2,10 @@
 
 A topbar tray wallpaper manager and rotator plugin for [Omarchy](https://omarchy.org/) Shell.
 
+<p align="center">
+  <img src="preview.png" alt="Wallpaper Rotator Preview" width="400">
+</p>
+
 ## Features
 
 - **Two Modes**:
