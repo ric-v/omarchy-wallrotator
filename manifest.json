@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "ric-v.wallrotator",
+  "name": "Wallpaper Rotator",
+  "version": "1.1.0",
+  "author": "ric-v",
+  "license": "MIT",
+  "homepage": "https://github.com/ric-v/omarchy-wallrotator",
+  "description": "Control static wallpapers from Wallhaven and live video wallpapers from Pixabay from the topbar tray. Includes Start/Stop rotation, next/previous/shuffle actions, time-of-day tags & Wallhaven color palettes, schedule, and recent 10 wallpapers.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Wallpaper Rotator",
+    "description": "Rotate static wallpapers from Wallhaven and live wallpapers from Pixabay",
+    "category": "Appearance",
+    "allowMultiple": false,
+    "defaultSection": "tray"
+  }
+}
