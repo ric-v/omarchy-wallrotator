@@ -29,6 +29,7 @@ Commands (every output is one JSON line on stdout):
 """
 
 import datetime
+import fcntl
 import hashlib
 import json
 import os
@@ -501,6 +502,22 @@ def save_state(state):
     write_private(STATE_FILE, json.dumps(state, indent=2, ensure_ascii=False))
 
 
+def update_state(mutator):
+    """Atomically reload, mutate, and save state.json under an exclusive file lock."""
+    prepare_storage()
+    lock_path = STATE_DIR / ".state.lock"
+    fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o600)
+    with os.fdopen(fd, "w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            latest = load_state()
+            mutator(latest)
+            save_state(latest)
+            return latest
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def status_response(state=None):
     if state is None:
         state = load_state()
@@ -838,11 +855,16 @@ def fetch_and_apply_new(state, force_shuffle=False):
         "tag": clean_tag(tag),
         "timestamp": int(time.time()),
     }
-    state["history"] = [entry] + [h for h in state["history"] if h["path"] != str(dest)]
-    state["history"] = state["history"][:MAX_HISTORY]
-    state["historyIndex"] = 0
-    save_state(state)
-    return status_response(state)
+    new_tag_cursor = state["tagCursor"]
+
+    def _commit(latest):
+        latest["history"] = [entry] + [h for h in latest["history"] if h["path"] != str(dest)]
+        latest["history"] = latest["history"][:MAX_HISTORY]
+        latest["historyIndex"] = 0
+        latest["tagCursor"] = new_tag_cursor
+
+    latest = update_state(_commit)
+    return status_response(latest)
 
 
 # ------------------------------------------------------------------ commands
@@ -853,20 +875,20 @@ def cmd_status():
 def cmd_set_mode(mode):
     if mode not in VALID_MODES:
         fail("usage")
-    state = load_state()
-    state["mode"] = mode
-    save_state(state)
-    out(status_response(state))
+    latest = update_state(lambda s: s.__setitem__("mode", mode))
+    out(status_response(latest))
 
 
 def cmd_set_running(val_str):
-    state = load_state()
     want = str(val_str).lower() in ("1", "true", "yes", "on", "start")
-    state["running"] = want
-    if want and state["scheduleMinutes"] == 0:
-        state["scheduleMinutes"] = 30
-    save_state(state)
-    out(status_response(state))
+
+    def _mutate(s):
+        s["running"] = want
+        if want and s["scheduleMinutes"] == 0:
+            s["scheduleMinutes"] = 30
+
+    latest = update_state(_mutate)
+    out(status_response(latest))
 
 
 def cmd_set_schedule(minutes_str):
@@ -876,18 +898,19 @@ def cmd_set_schedule(minutes_str):
         fail("usage")
     if m not in VALID_SCHEDULES:
         fail("usage")
-    state = load_state()
-    state["scheduleMinutes"] = m
-    state["running"] = m > 0
-    save_state(state)
-    out(status_response(state))
+
+    def _mutate(s):
+        s["scheduleMinutes"] = m
+        s["running"] = m > 0
+
+    latest = update_state(_mutate)
+    out(status_response(latest))
 
 
 def cmd_set_shuffle(val_str):
-    state = load_state()
-    state["shuffle"] = str(val_str).lower() in ("1", "true", "yes", "on")
-    save_state(state)
-    out(status_response(state))
+    want = str(val_str).lower() in ("1", "true", "yes", "on")
+    latest = update_state(lambda s: s.__setitem__("shuffle", want))
+    out(status_response(latest))
 
 
 def cmd_add_tag(raw_tag, period=None):
@@ -895,32 +918,34 @@ def cmd_add_tag(raw_tag, period=None):
     if not t:
         fail("usage")
     p = period if period in PERIODS else current_period()
-    state = load_state()
-    tags = state["periodTags"].get(p, [])
-    if t not in tags:
-        state["periodTags"][p] = (tags + [t])[:MAX_TAGS]
-        save_state(state)
-    out(status_response(state))
+
+    def _mutate(s):
+        tags = s["periodTags"].get(p, [])
+        if t not in tags:
+            s["periodTags"][p] = (tags + [t])[:MAX_TAGS]
+
+    latest = update_state(_mutate)
+    out(status_response(latest))
 
 
 def cmd_remove_tag(raw_tag, period=None):
     t = clean_tag(raw_tag)
     p = period if period in PERIODS else current_period()
-    state = load_state()
-    tags = state["periodTags"].get(p, [])
-    state["periodTags"][p] = [x for x in tags if x != t]
-    save_state(state)
-    out(status_response(state))
+
+    def _mutate(s):
+        tags = s["periodTags"].get(p, [])
+        s["periodTags"][p] = [x for x in tags if x != t]
+
+    latest = update_state(_mutate)
+    out(status_response(latest))
 
 
 def cmd_set_color(period, raw_color):
     if period not in PERIODS:
         fail("usage")
     c = clean_color(raw_color)
-    state = load_state()
-    state["periodColors"][period] = c
-    save_state(state)
-    out(status_response(state))
+    latest = update_state(lambda s: s["periodColors"].__setitem__(period, c))
+    out(status_response(latest))
 
 
 def cmd_set_key(provider):
@@ -958,9 +983,16 @@ def cmd_next(force_shuffle=False):
         if Path(target).is_file():
             if not set_background(target):
                 fail("apply_failed")
-            state["historyIndex"] = new_idx
-            save_state(state)
-            out(status_response(state))
+
+            def _commit_idx(latest):
+                for i, h in enumerate(latest["history"]):
+                    if h["path"] == target:
+                        latest["historyIndex"] = i
+                        return
+                latest["historyIndex"] = max(0, min(new_idx, max(0, len(latest["history"]) - 1)))
+
+            latest = update_state(_commit_idx)
+            out(status_response(latest))
             return
     try:
         out(fetch_and_apply_new(state, force_shuffle=force_shuffle))
@@ -982,15 +1014,20 @@ def cmd_prev():
         fail("bad_path")
     if not set_background(target):
         fail("apply_failed")
-    state["historyIndex"] = target_idx
-    save_state(state)
-    out(status_response(state))
+
+    def _commit_idx(latest):
+        for i, h in enumerate(latest["history"]):
+            if h["path"] == target:
+                latest["historyIndex"] = i
+                return
+        latest["historyIndex"] = max(0, min(target_idx, max(0, len(latest["history"]) - 1)))
+
+    latest = update_state(_commit_idx)
+    out(status_response(latest))
 
 
 def cmd_shuffle():
-    state = load_state()
-    state["shuffle"] = True
-    save_state(state)
+    state = update_state(lambda s: s.__setitem__("shuffle", True))
     try:
         out(fetch_and_apply_new(state, force_shuffle=True))
     except WRError as e:
@@ -1011,12 +1048,15 @@ def cmd_apply(path_arg):
         fail("bad_path")
     if not set_background(real):
         fail("apply_failed")
-    for i, h in enumerate(state["history"]):
-        if h["path"] == str(real):
-            state["historyIndex"] = i
-            break
-    save_state(state)
-    out(status_response(state))
+
+    def _commit_apply(latest):
+        for i, h in enumerate(latest["history"]):
+            if h["path"] == str(real):
+                latest["historyIndex"] = i
+                break
+
+    latest = update_state(_commit_apply)
+    out(status_response(latest))
 
 
 def main(argv):

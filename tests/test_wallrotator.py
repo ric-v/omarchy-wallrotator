@@ -244,6 +244,44 @@ class StateAndCommandsTests(unittest.TestCase):
         self.assertTrue(existing_muted.is_file())
         self.assertEqual(existing_muted.read_bytes(), b"USER_OWNED_DATA")
 
+    def test_concurrent_fetch_preserves_saved_stop_and_off_schedule(self):
+        # Start with active schedule (running=True, scheduleMinutes=30)
+        self.run_json(wr.cmd_set_schedule, "30")
+        stale_state = wr.load_state()
+        self.assertTrue(stale_state["running"])
+        self.assertEqual(stale_state["scheduleMinutes"], 30)
+
+        fake_item = [{
+            "id": "z9y8x7",
+            "url": "https://w.wallhaven.cc/full/z9/wallhaven-z9y8x7.jpg",
+            "thumbUrl": "",
+            "ext": ".jpg",
+            "resolution": "1920x1080",
+            "title": "Wallhaven #z9y8x7 (nature)",
+            "tag": "nature",
+        }]
+
+        def fake_download_image(url, dest):
+            # Simulate another monitor/instance clicking Off while this fetch is in flight
+            self.run_json(wr.cmd_set_schedule, "0")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(b"\xff\xd8\xff\xe0fakejpeg")
+
+        with mock.patch.object(wr, "search_wallhaven", return_value=fake_item), \
+             mock.patch.object(wr, "download_image", side_effect=fake_download_image), \
+             mock.patch.object(wr, "fetch_thumb", return_value=""), \
+             mock.patch.object(wr, "set_background", return_value=True):
+            result = wr.fetch_and_apply_new(stale_state)
+
+        self.assertFalse(result["running"])
+        self.assertEqual(result["scheduleMinutes"], 0)
+        self.assertEqual(result["history"][0]["id"], "wallhaven-z9y8x7")
+
+        persisted = wr.load_state()
+        self.assertFalse(persisted["running"])
+        self.assertEqual(persisted["scheduleMinutes"], 0)
+        self.assertEqual(persisted["history"][0]["id"], "wallhaven-z9y8x7")
+
     def test_qml_queues_schedule_changes_during_fetch(self):
         qml = (ROOT / "Panel.qml").read_text()
         self.assertIn("function queueCommand", qml)
