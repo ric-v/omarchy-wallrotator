@@ -18,6 +18,6 @@
     "description": "Rotate static wallpapers from Wallhaven and live wallpapers from Pixabay",
     "category": "Appearance",
     "allowMultiple": false,
-    "defaultSection": "tray"
+    "defaultSection": "right"
   }
 }
