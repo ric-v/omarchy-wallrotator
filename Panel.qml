@@ -7,7 +7,8 @@ import qs.Commons
 import qs.Commons as Commons
 import qs.Ui
 
-// Topbar tray wallpaper rotator supporting:
+// Omarchy topbar front-end for wallrotator.py (see wallrotator_tray.py for the
+// standalone system tray app used on other desktops). Supports:
 // - Start / Stop auto-rotation control
 // - Static wallpapers from Wallhaven (with optional per-period color palette)
 // - Live video wallpapers from Pixabay

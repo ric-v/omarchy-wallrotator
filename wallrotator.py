@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Backend for the ric-v.wallrotator Omarchy shell plugin.
+"""Backend for Wallpaper Rotator (ric-v.wallrotator).
+
+Desktop-agnostic: used by the Omarchy shell plugin (Panel.qml) and by the
+standalone system tray app (wallrotator_tray.py) on any Linux/BSD desktop.
 
 Supports two wallpaper modes:
   - wallhaven: Static wallpapers from Wallhaven (https://wallhaven.cc/api/v1/search)
@@ -22,10 +25,21 @@ Commands (every output is one JSON line on stdout):
   wallrotator.py remove-tag <tag> [period]
   wallrotator.py set-color <period> <hex|none>
   wallrotator.py set-key <pixabay|wallhaven>   (reads key from stdin)
+  wallrotator.py set-backend <auto|backend>
   wallrotator.py next
   wallrotator.py prev
   wallrotator.py shuffle
   wallrotator.py apply <path>
+
+Wallpaper backends (auto-detected, override with set-backend or the
+WALLROTATOR_BACKEND environment variable):
+  omarchy, gnome (also Budgie/Pantheon/Unity/COSMIC-on-GNOME), cinnamon, mate,
+  kde, xfce, lxqt, lxde, hyprpaper, swww (or awww), sway, swaybg, feh,
+  xwallpaper, nitrogen, hsetroot
+
+Live (video) wallpapers use the first available engine: owe (Omarchy),
+mpvpaper (Wayland compositors with layer-shell), or xwinwrap + mpv (X11).
+Without one, a still frame of the video is set as a static wallpaper.
 """
 
 import datetime
@@ -36,6 +50,7 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,6 +61,7 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path.home()
+XDG_DATA_HOME = Path(os.environ.get("XDG_DATA_HOME") or HOME / ".local/share")
 STATE_DIR = HOME / ".local/state/wallrotator"
 LIVEWALL_STATE_DIR = HOME / ".local/state/livewall"
 STATE_FILE = STATE_DIR / "state.json"
@@ -54,11 +70,14 @@ CURRENT_BG_LINK = HOME / ".local/state/omarchy/current/background"
 THEME_BG_DIR = HOME / ".local/state/omarchy/current/theme/backgrounds"
 BG_ROOT = HOME / ".config/omarchy/backgrounds"
 PICTURES_ROTATE_DIR = HOME / "Pictures/wallrotate"
+OMARCHY_SHARE_DIR = HOME / ".local/share/omarchy"
+# Download location on non-Omarchy desktops
+GENERIC_WALL_DIR = Path(os.environ.get("WALLROTATOR_DIR") or XDG_DATA_HOME / "wallrotator/wallpapers")
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "wallrotator"
 THUMB_DIR = CACHE_DIR / "thumbs"
 SEARCH_DIR = CACHE_DIR / "search"
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 UA = f"omarchy-wallrotator/{VERSION}"
 TIMEOUT = 20
 SEARCH_TTL = 1800
@@ -90,6 +109,30 @@ WALLHAVEN_COLORS = (
 )
 
 STATIC_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+# Paths handed to tools that parse a command string (swaymsg, hyprctl) must match this.
+SAFE_PATH_RE = re.compile(r"[A-Za-z0-9._/+-]+")
+
+# backend -> executables (any one is enough for the backend to be usable)
+BACKEND_TOOLS = {
+    "omarchy": ("omarchy",),
+    "gnome": ("gsettings",),
+    "cinnamon": ("gsettings",),
+    "mate": ("gsettings",),
+    "kde": ("plasma-apply-wallpaperimage", "qdbus6", "qdbus"),
+    "xfce": ("xfconf-query",),
+    "lxqt": ("pcmanfm-qt",),
+    "lxde": ("pcmanfm",),
+    "hyprpaper": ("hyprctl",),
+    "swww": ("awww", "swww"),
+    "sway": ("swaymsg",),
+    "swaybg": ("swaybg",),
+    "feh": ("feh",),
+    "xwallpaper": ("xwallpaper",),
+    "nitrogen": ("nitrogen",),
+    "hsetroot": ("hsetroot",),
+}
+BACKENDS = tuple(BACKEND_TOOLS)
+LIVE_ENGINES = ("omarchy", "mpvpaper", "xwinwrap", "frame")
 VIDEO_EXTS = {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
 
 WALLHAVEN_API = "https://wallhaven.cc/api/v1/search"
@@ -190,11 +233,23 @@ def _resolve(p):
         return None
 
 
-def current_background():
+def omarchy_background():
     if CURRENT_BG_LINK.is_symlink() or CURRENT_BG_LINK.is_file():
         r = _resolve(CURRENT_BG_LINK)
         if r and r.is_file():
             return str(r)
+    return ""
+
+
+def current_background(saved_path="", backend="omarchy"):
+    """Active wallpaper: Omarchy's background symlink, else the path we last applied."""
+    if backend == "omarchy":
+        cur = omarchy_background()
+        if cur:
+            return cur
+    p = str(saved_path or "")
+    if p and Path(p).is_file():
+        return p
     return ""
 
 
@@ -287,20 +342,22 @@ def fetch_thumb(prefix, item_id, url):
         return ""
 
 
-def frame_thumb(video_path, dest):
+def frame_thumb(video_path, dest, width=480):
     if dest.is_file() and dest.stat().st_size > 0:
         return str(dest)
     if not shutil.which("ffmpeg"):
         return ""
     prepare_storage()
+    private_dir(dest.parent)
     tmp = dest.with_name(dest.stem + ".tmp.jpg")
+    scale = ["-vf", f"scale={int(width)}:-2", "-q:v", "4"] if width else ["-q:v", "2"]
     try:
         subprocess.run(
             [
                 "ffmpeg", "-nostdin", "-loglevel", "error", "-y",
                 "-protocol_whitelist", "file", "-ss", "1.0",
                 "-i", str(video_path), "-frames:v", "1",
-                "-vf", "scale=480:-2", "-q:v", "4", str(tmp),
+                *scale, str(tmp),
             ],
             capture_output=True,
             timeout=15,
@@ -316,7 +373,7 @@ def frame_thumb(video_path, dest):
     return ""
 
 
-def seed_existing_backgrounds(existing_history):
+def seed_existing_backgrounds(existing_history, cur=""):
     """Ensure recent history includes existing theme backgrounds if fewer than MAX_HISTORY."""
     seen = {h.get("path") for h in existing_history if h.get("path")}
     seeded = list(existing_history)
@@ -324,13 +381,12 @@ def seed_existing_backgrounds(existing_history):
         return seeded[:MAX_HISTORY]
 
     theme = theme_slug()
-    dirs = [BG_ROOT / theme, THEME_BG_DIR, PICTURES_ROTATE_DIR]
+    dirs = [GENERIC_WALL_DIR, BG_ROOT / theme, THEME_BG_DIR, PICTURES_ROTATE_DIR]
     if BG_ROOT.is_dir():
         for sub in sorted(BG_ROOT.iterdir()):
             if sub.is_dir() and sub not in dirs:
                 dirs.append(sub)
     candidates = []
-    cur = current_background()
     for d in dirs:
         if not d.is_dir():
             continue
@@ -386,16 +442,24 @@ def seed_existing_backgrounds(existing_history):
     return seeded[:MAX_HISTORY]
 
 
-def load_state():
-    prepare_storage()
-    raw = {}
+def _raw_state():
     if STATE_FILE.is_file():
         try:
             raw = json.loads(STATE_FILE.read_text())
-            if not isinstance(raw, dict):
-                raw = {}
+            if isinstance(raw, dict):
+                return raw
         except (OSError, ValueError):
-            raw = {}
+            pass
+    return {}
+
+
+def load_state():
+    prepare_storage()
+    raw = _raw_state()
+
+    backend_setting = str(raw.get("backend") or "auto")
+    if backend_setting not in BACKENDS:
+        backend_setting = "auto"
 
     mode = raw.get("mode") if raw.get("mode") in VALID_MODES else "wallhaven"
 
@@ -470,9 +534,8 @@ def load_state():
         if len(history) >= MAX_HISTORY:
             break
 
-    history = seed_existing_backgrounds(history)
-
-    cur = current_background()
+    cur = current_background(raw.get("currentPath"), resolve_backend(backend_setting))
+    history = seed_existing_backgrounds(history, cur)
     try:
         hist_idx = int(raw.get("historyIndex", 0))
     except (TypeError, ValueError):
@@ -494,6 +557,8 @@ def load_state():
         "shuffle": shuffle,
         "history": history,
         "historyIndex": hist_idx,
+        "backend": backend_setting,
+        "currentPath": cur,
     }
 
 
@@ -524,6 +589,7 @@ def status_response(state=None):
     px_key = read_key("pixabay")
     wh_key = read_key("wallhaven")
     period = current_period()
+    backend = resolve_backend(state.get("backend", "auto"))
     return {
         "ok": True,
         "mode": state["mode"],
@@ -536,36 +602,407 @@ def status_response(state=None):
         "shuffle": state["shuffle"],
         "history": state["history"][:MAX_HISTORY],
         "historyIndex": state["historyIndex"],
-        "currentPath": current_background(),
+        "currentPath": current_background(state.get("currentPath"), backend),
         "theme": theme_slug(),
         "hasPixabayKey": valid_pixabay_key(px_key),
         "hasWallhavenKey": valid_wallhaven_key(wh_key),
+        "desktop": desktop_name(),
+        "backend": backend,
+        "backendSetting": state.get("backend", "auto"),
+        "detectedBackend": detect_backend(),
+        "availableBackends": available_backends(),
+        "liveEngine": detect_live_engine(backend),
     }
 
 
-def set_background(path):
-    ok = False
+def wallpaper_dir(backend):
+    if backend == "omarchy":
+        return BG_ROOT / theme_slug()
+    return GENERIC_WALL_DIR
+
+
+# ------------------------------------------------------------ desktop backends
+def _desktop_tokens(env):
+    raw = ":".join(
+        str(env.get(k) or "") for k in ("XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP", "DESKTOP_SESSION")
+    ).lower()
+    return {t for t in re.split(r"[:;,\s/]+", raw) if t}
+
+
+def _is_wayland(env):
+    return bool(env.get("WAYLAND_DISPLAY")) or str(env.get("XDG_SESSION_TYPE") or "").lower() == "wayland"
+
+
+def _first_tool(names, which=None):
+    which = which or shutil.which
+    for n in names:
+        if which(n):
+            return n
+    return ""
+
+
+def is_omarchy(which=None):
+    which = which or shutil.which
+    return bool(which("omarchy")) and (OMARCHY_SHARE_DIR.is_dir() or CURRENT_BG_LINK.parent.is_dir())
+
+
+def desktop_name(env=None):
+    """Human-readable desktop/session label for status output."""
+    env = os.environ if env is None else env
+    cur = neutralize_markup(env.get("XDG_CURRENT_DESKTOP") or env.get("XDG_SESSION_DESKTOP")
+                            or env.get("DESKTOP_SESSION") or "", 40)
+    if cur:
+        return cur
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE"):
+        return "Hyprland"
+    if env.get("SWAYSOCK"):
+        return "sway"
+    if _is_wayland(env):
+        return "Wayland"
+    if env.get("DISPLAY"):
+        return "X11"
+    return "unknown"
+
+
+def detect_backend(env=None, which=None):
+    """Pick the best wallpaper backend for the running desktop, or "none"."""
+    env = os.environ if env is None else env
+    which = which or shutil.which
+    has = lambda b: bool(_first_tool(BACKEND_TOOLS[b], which))
+    tokens = _desktop_tokens(env)
+
+    if is_omarchy(which):
+        return "omarchy"
+    if tokens & {"kde", "plasma", "plasmawayland", "plasmax11"} and has("kde"):
+        return "kde"
+    if tokens & {"cinnamon", "x-cinnamon"} and has("cinnamon"):
+        return "cinnamon"
+    if "mate" in tokens and has("mate"):
+        return "mate"
+    if tokens & {"xfce", "xfce4", "xubuntu"} and has("xfce"):
+        return "xfce"
+    if "lxqt" in tokens and has("lxqt"):
+        return "lxqt"
+    if tokens & {"lxde", "lubuntu"} and has("lxde"):
+        return "lxde"
+    if tokens & {"gnome", "gnome-classic", "gnome-xorg", "ubuntu", "unity", "budgie",
+                 "budgie-desktop", "pantheon", "pop", "zorin", "deepin"} and has("gnome"):
+        return "gnome"
+
+    if env.get("HYPRLAND_INSTANCE_SIGNATURE") or "hyprland" in tokens:
+        for b in ("swww", "hyprpaper", "swaybg"):
+            if has(b):
+                return b
+    if env.get("SWAYSOCK") or "sway" in tokens:
+        for b in ("swww", "sway", "swaybg"):
+            if has(b):
+                return b
+    if _is_wayland(env):
+        # river, niri, wayfire, labwc, Hyprland without hyprpaper, ...
+        for b in ("swww", "swaybg"):
+            if has(b):
+                return b
+    if env.get("DISPLAY"):
+        # i3, bspwm, openbox, awesome, dwm, xmonad, ...
+        for b in ("feh", "xwallpaper", "nitrogen", "hsetroot"):
+            if has(b):
+                return b
+    return "none"
+
+
+def available_backends(which=None):
+    which = which or shutil.which
+    out_list = []
+    for b in BACKENDS:
+        if b == "omarchy":
+            if is_omarchy(which):
+                out_list.append(b)
+        elif _first_tool(BACKEND_TOOLS[b], which):
+            out_list.append(b)
+    return out_list
+
+
+def resolve_backend(setting="auto", env=None, which=None):
+    env = os.environ if env is None else env
+    override = str(env.get("WALLROTATOR_BACKEND") or "").strip().lower()
+    if override in BACKENDS:
+        return override
+    if setting in BACKENDS:
+        return setting
+    return detect_backend(env, which)
+
+
+def detect_live_engine(backend, env=None, which=None):
+    env = os.environ if env is None else env
+    which = which or shutil.which
+    override = str(env.get("WALLROTATOR_LIVE_ENGINE") or "").strip().lower()
+    if override in LIVE_ENGINES:
+        return override
+    if backend == "omarchy":
+        return "omarchy"
+    tokens = _desktop_tokens(env)
+    if _is_wayland(env):
+        # mpvpaper needs wlr-layer-shell, which GNOME's compositor does not provide
+        if which("mpvpaper") and not (tokens & {"gnome", "ubuntu", "unity", "pantheon", "budgie", "pop"}):
+            return "mpvpaper"
+    elif env.get("DISPLAY") and which("xwinwrap") and which("mpv"):
+        return "xwinwrap"
+    return "frame"
+
+
+def _run(cmd, timeout=15):
     try:
         r = subprocess.run(
-            ["omarchy", "theme", "bg", "set", str(path)],
-            capture_output=True,
-            text=True,
-            timeout=30,
+            cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL,
         )
-        ok = r.returncode == 0
+        return r.returncode == 0, r.stdout or ""
     except (OSError, subprocess.TimeoutExpired):
-        ok = False
-    if shutil.which("owe"):
+        return False, ""
+
+
+def _pid_file(name):
+    return STATE_DIR / f"{name}.pid"
+
+
+def _proc_name(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        pass
+    ok, stdout = _run(["ps", "-p", str(pid), "-o", "comm="], timeout=5)
+    return Path(stdout.strip()).name if ok else ""
+
+
+def _kill_tracked(name, expected):
+    """Stop a detached helper we started earlier, only if the pid still belongs to it."""
+    pf = _pid_file(name)
+    try:
+        pid = int(pf.read_text().strip())
+    except (OSError, ValueError):
+        pf.unlink(missing_ok=True)
+        return
+    pf.unlink(missing_ok=True)
+    if pid <= 1 or _proc_name(pid) not in expected:
+        return
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except OSError:
         try:
-            subprocess.run(
-                ["owe", "set", str(path)],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        except (OSError, subprocess.TimeoutExpired):
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
             pass
+
+
+def _spawn_tracked(name, cmd):
+    """Start a long-running helper (swaybg, mpvpaper, xwinwrap) detached from us."""
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except OSError:
+        return False
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        return False
+    try:
+        write_private(_pid_file(name), f"{proc.pid}\n")
+    except OSError:
+        pass
+    return True
+
+
+def stop_live():
+    _kill_tracked("live", {"mpvpaper", "xwinwrap", "mpv"})
+
+
+def safe_alias(path):
+    """Return a path free of characters that command-string parsers would interpret."""
+    p = str(path)
+    if SAFE_PATH_RE.fullmatch(p):
+        return p
+    links = CACHE_DIR / "links"
+    private_dir(links)
+    ext = re.sub(r"[^a-z0-9.]", "", Path(p).suffix.lower())[:6]
+    link = links / (hashlib.sha256(p.encode()).hexdigest()[:20] + ext)
+    try:
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(p)
+    except OSError:
+        return ""
+    s = str(link)
+    return s if SAFE_PATH_RE.fullmatch(s) else ""
+
+
+def _gsettings(schema, key, value):
+    return _run(["gsettings", "set", schema, key, value])[0]
+
+
+def _set_kde(path):
+    if shutil.which("plasma-apply-wallpaperimage"):
+        if _run(["plasma-apply-wallpaperimage", path], timeout=30)[0]:
+            return True
+    qdbus = _first_tool(("qdbus6", "qdbus"))
+    if not qdbus:
+        return False
+    # json.dumps produces a safely escaped JS string literal
+    script = (
+        "var ds = desktops(); for (var i = 0; i < ds.length; i++) {"
+        " var d = ds[i]; d.wallpaperPlugin = 'org.kde.image';"
+        " d.currentConfigGroup = ['Wallpaper', 'org.kde.image', 'General'];"
+        f" d.writeConfig('Image', {json.dumps(Path(path).as_uri())}); }}"
+    )
+    return _run([qdbus, "org.kde.plasmashell", "/PlasmaShell",
+                 "org.kde.PlasmaShell.evaluateScript", script], timeout=30)[0]
+
+
+def _set_xfce(path):
+    ok, listing = _run(["xfconf-query", "-c", "xfce4-desktop", "-l"])
+    props = [ln.strip() for ln in listing.splitlines() if ln.strip().endswith("/last-image")] if ok else []
+    if not props:
+        props = ["/backdrop/screen0/monitor0/workspace0/last-image"]
+    any_ok = False
+    for prop in props:
+        if _run(["xfconf-query", "-c", "xfce4-desktop", "-p", prop, "-n", "-t", "string", "-s", path])[0]:
+            any_ok = True
+        elif _run(["xfconf-query", "-c", "xfce4-desktop", "-p", prop, "-s", path])[0]:
+            any_ok = True
+    return any_ok
+
+
+def _set_swww(path):
+    tool = _first_tool(("awww", "swww"))
+    if not tool:
+        return False
+    if not _run([tool, "query"], timeout=5)[0]:
+        daemon = f"{tool}-daemon"
+        if not shutil.which(daemon) or not _spawn_tracked("swww-daemon", [daemon]):
+            return False
+        for _ in range(10):
+            if _run([tool, "query"], timeout=5)[0]:
+                break
+            time.sleep(0.3)
+    return _run([tool, "img", path, "--transition-type", "fade"], timeout=30)[0]
+
+
+def _set_hyprpaper(path):
+    safe = safe_alias(path)
+    if not safe:
+        return False
+    if _run(["hyprctl", "hyprpaper", "reload", f",{safe}"])[0]:
+        return True
+    _run(["hyprctl", "hyprpaper", "preload", safe])
+    ok = _run(["hyprctl", "hyprpaper", "wallpaper", f",{safe}"])[0]
+    _run(["hyprctl", "hyprpaper", "unload", "unused"])
     return ok
+
+
+def _set_sway(path):
+    safe = safe_alias(path)
+    if not safe:
+        return False
+    return _run(["swaymsg", "output", "*", "bg", safe, "fill"])[0]
+
+
+def _set_swaybg(path):
+    _kill_tracked("swaybg", {"swaybg"})
+    return _spawn_tracked("swaybg", ["swaybg", "-m", "fill", "-i", path])
+
+
+def set_static(backend, path):
+    path = str(path)
+    if backend == "gnome":
+        uri = Path(path).as_uri()
+        ok = _gsettings("org.gnome.desktop.background", "picture-uri", uri)
+        _gsettings("org.gnome.desktop.background", "picture-uri-dark", uri)
+        _gsettings("org.gnome.desktop.background", "picture-options", "zoom")
+        return ok
+    if backend == "cinnamon":
+        ok = _gsettings("org.cinnamon.desktop.background", "picture-uri", Path(path).as_uri())
+        _gsettings("org.cinnamon.desktop.background", "picture-options", "zoom")
+        return ok
+    if backend == "mate":
+        ok = _gsettings("org.mate.background", "picture-filename", path)
+        _gsettings("org.mate.background", "picture-options", "zoom")
+        return ok
+    if backend == "kde":
+        return _set_kde(path)
+    if backend == "xfce":
+        return _set_xfce(path)
+    if backend == "lxqt":
+        return _run(["pcmanfm-qt", f"--set-wallpaper={path}", "--wallpaper-mode=zoom"])[0]
+    if backend == "lxde":
+        return _run(["pcmanfm", f"--set-wallpaper={path}", "--wallpaper-mode=crop"])[0]
+    if backend == "hyprpaper":
+        return _set_hyprpaper(path)
+    if backend == "swww":
+        return _set_swww(path)
+    if backend == "sway":
+        return _set_sway(path)
+    if backend == "swaybg":
+        return _set_swaybg(path)
+    if backend == "feh":
+        return _run(["feh", "--bg-fill", path])[0]
+    if backend == "xwallpaper":
+        return _run(["xwallpaper", "--zoom", path])[0]
+    if backend == "nitrogen":
+        return _run(["nitrogen", "--set-zoom-fill", "--save", path])[0]
+    if backend == "hsetroot":
+        return _run(["hsetroot", "-cover", path])[0]
+    return False
+
+
+def start_live(engine, path):
+    stop_live()
+    path = str(path)
+    if engine == "mpvpaper":
+        return _spawn_tracked("live", [
+            "mpvpaper", "-o", "no-audio loop panscan=1.0 hwdec=auto", "ALL", path,
+        ])
+    if engine == "xwinwrap":
+        return _spawn_tracked("live", [
+            "xwinwrap", "-fs", "-ov", "-ni", "-nf", "-un", "-s", "-st", "-sp", "-b", "-fdt", "--",
+            "mpv", "-wid", "WID", "--loop", "--no-audio", "--no-osc", "--no-osd-bar",
+            "--no-input-default-bindings", "--panscan=1.0", "--hwdec=auto", path,
+        ])
+    return False
+
+
+def video_still(video_path):
+    sig = hashlib.sha256(str(video_path).encode()).hexdigest()[:16]
+    return frame_thumb(video_path, CACHE_DIR / "frames" / f"still-{sig}.jpg", width=None)
+
+
+def _set_omarchy(path):
+    ok = _run(["omarchy", "theme", "bg", "set", str(path)], timeout=30)[0]
+    if shutil.which("owe"):
+        _run(["owe", "set", str(path)], timeout=10)
+    return ok
+
+
+def set_background(path, backend=None):
+    """Apply a static image or live video using the resolved desktop backend."""
+    if backend is None:
+        backend = resolve_backend(_raw_state().get("backend", "auto"))
+    if backend == "omarchy":
+        return _set_omarchy(path)
+    if backend not in BACKENDS:
+        return False
+    if Path(str(path)).suffix.lower() in VIDEO_EXTS:
+        still = video_still(path)
+        engine = detect_live_engine(backend)
+        if engine in ("mpvpaper", "xwinwrap"):
+            if still:
+                set_static(backend, still)  # visible on lock screens / overview
+            return start_live(engine, path)
+        stop_live()
+        return bool(still) and set_static(backend, still)
+    stop_live()
+    return set_static(backend, path)
 
 
 # --------------------------------------------------------- Wallhaven & Pixabay
@@ -811,8 +1248,10 @@ def fetch_and_apply_new(state, force_shuffle=False):
     tag = pick_tag(state, period, force_shuffle=use_shuffle)
     color = state["periodColors"].get(period, "")
     mode = state["mode"]
-    theme = theme_slug()
-    dest_dir = BG_ROOT / theme
+    backend = resolve_backend(state.get("backend", "auto"))
+    if backend == "none":
+        raise WRError("no_backend")
+    dest_dir = wallpaper_dir(backend)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
     seen_ids = {h.get("id") for h in state["history"]}
@@ -842,8 +1281,8 @@ def fetch_and_apply_new(state, force_shuffle=False):
             thumb = frame_thumb(dest, THUMB_DIR / f"pixabay-{chosen['id']}.jpg")
         entry_id = f"pixabay-{chosen['id']}"
 
-    if not set_background(dest):
-        raise WRError("apply_failed")
+    if not set_background(dest, backend):
+        raise WRError("apply_failed", backend)
 
     entry = {
         "id": neutralize_markup(entry_id, 40),
@@ -862,14 +1301,30 @@ def fetch_and_apply_new(state, force_shuffle=False):
         latest["history"] = latest["history"][:MAX_HISTORY]
         latest["historyIndex"] = 0
         latest["tagCursor"] = new_tag_cursor
+        latest["currentPath"] = str(dest)
 
     latest = update_state(_commit)
     return status_response(latest)
 
 
 # ------------------------------------------------------------------ commands
+def require_backend(state):
+    backend = resolve_backend(state.get("backend", "auto"))
+    if backend == "none":
+        fail("no_backend")
+    return backend
+
+
 def cmd_status():
     out(status_response())
+
+
+def cmd_set_backend(name):
+    name = str(name or "").strip().lower()
+    if name != "auto" and name not in BACKENDS:
+        fail("usage")
+    latest = update_state(lambda s: s.__setitem__("backend", name))
+    out(status_response(latest))
 
 
 def cmd_set_mode(mode):
@@ -981,10 +1436,12 @@ def cmd_next(force_shuffle=False):
         new_idx = state["historyIndex"] - 1
         target = state["history"][new_idx]["path"]
         if Path(target).is_file():
-            if not set_background(target):
-                fail("apply_failed")
+            backend = require_backend(state)
+            if not set_background(target, backend):
+                fail("apply_failed", backend)
 
             def _commit_idx(latest):
+                latest["currentPath"] = target
                 for i, h in enumerate(latest["history"]):
                     if h["path"] == target:
                         latest["historyIndex"] = i
@@ -1012,10 +1469,12 @@ def cmd_prev():
     target = hist[target_idx]["path"]
     if not Path(target).is_file():
         fail("bad_path")
-    if not set_background(target):
-        fail("apply_failed")
+    backend = require_backend(state)
+    if not set_background(target, backend):
+        fail("apply_failed", backend)
 
     def _commit_idx(latest):
+        latest["currentPath"] = target
         for i, h in enumerate(latest["history"]):
             if h["path"] == target:
                 latest["historyIndex"] = i
@@ -1041,15 +1500,18 @@ def cmd_apply(path_arg):
     bg_root_real = _resolve(BG_ROOT)
     theme_bg_real = _resolve(THEME_BG_DIR)
     pics_real = _resolve(PICTURES_ROTATE_DIR)
+    generic_real = _resolve(GENERIC_WALL_DIR)
     state = load_state()
     in_history = any(h["path"] == str(real) for h in state["history"])
-    allowed_roots = [r for r in (bg_root_real, theme_bg_real, pics_real) if r is not None]
+    allowed_roots = [r for r in (bg_root_real, theme_bg_real, pics_real, generic_real) if r is not None]
     if not in_history and not any(r in real.parents for r in allowed_roots):
         fail("bad_path")
-    if not set_background(real):
-        fail("apply_failed")
+    backend = require_backend(state)
+    if not set_background(real, backend):
+        fail("apply_failed", backend)
 
     def _commit_apply(latest):
+        latest["currentPath"] = str(real)
         for i, h in enumerate(latest["history"]):
             if h["path"] == str(real):
                 latest["historyIndex"] = i
@@ -1081,6 +1543,8 @@ def main(argv):
         cmd_set_color(args[0], args[1])
     elif cmd == "set-key" and args:
         cmd_set_key(args[0])
+    elif cmd == "set-backend" and args:
+        cmd_set_backend(args[0])
     elif cmd == "next":
         cmd_next(force_shuffle="--shuffle" in args)
     elif cmd == "prev":
