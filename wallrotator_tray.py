@@ -27,6 +27,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
@@ -336,7 +337,12 @@ class FlowLayout(_QLayout):
 
 
 class ControlWindow(_QWidget):
-    """Full control panel, equivalent to the Omarchy popup."""
+    """Control panel, shown as a popover next to the tray icon (or a normal
+    window when the desktop has no tray). Equivalent to the Omarchy popup."""
+
+    POPOVER_WIDTH = 420
+    POPOVER_MAX_HEIGHT = 720
+    POPOVER_MARGIN = 8
 
     def __init__(self, ctrl):
         super().__init__()
@@ -346,6 +352,10 @@ class ControlWindow(_QWidget):
         self._recent_sig = None
         self._thumbs = {}
         self.minimize_on_close = False
+        self.popover = False
+        self.editing_key = False
+        self.last_hidden = 0.0
+        self.wayland = QtGui.QGuiApplication.platformName().startswith("wayland")
 
         self.setWindowTitle(t("panel.title"))
         self.setWindowIcon(make_icon())
@@ -353,12 +363,20 @@ class ControlWindow(_QWidget):
 
         outer = QtWidgets.QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
+        self.frame = QtWidgets.QFrame()
+        self.frame.setObjectName("popoverFrame")
+        outer.addWidget(self.frame)
+        frame_l = QtWidgets.QVBoxLayout(self.frame)
+        frame_l.setContentsMargins(1, 1, 1, 1)
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(qe(QtCore.Qt, "ScrollBarPolicy", "ScrollBarAlwaysOff"))
         scroll.setFrameShape(qe(QtWidgets.QFrame, "Shape", "NoFrame"))
-        outer.addWidget(scroll)
+        scroll.setStyleSheet("QScrollArea { background: transparent; }")
+        scroll.viewport().setAutoFillBackground(False)
+        frame_l.addWidget(scroll)
         body = QtWidgets.QWidget()
+        body.setAutoFillBackground(False)
         scroll.setWidget(body)
         col = QtWidgets.QVBoxLayout(body)
         col.setContentsMargins(16, 14, 16, 16)
@@ -382,6 +400,12 @@ class ControlWindow(_QWidget):
         self.run_btn = QtWidgets.QPushButton()
         self.run_btn.clicked.connect(lambda *_: self.ctrl.toggle_running())
         head.addWidget(self.run_btn)
+        self.close_btn = QtWidgets.QToolButton()
+        self.close_btn.setText("✕")
+        self.close_btn.setAutoRaise(True)
+        self.close_btn.setToolTip(t("tray.close"))
+        self.close_btn.clicked.connect(lambda *_: self.hide())
+        head.addWidget(self.close_btn, 0, qe(QtCore.Qt, "AlignmentFlag", "AlignTop"))
         col.addLayout(head)
 
         self.hint_label = self._caption(t("tray.noTray"))
@@ -411,9 +435,23 @@ class ControlWindow(_QWidget):
         self.key_label.setWordWrap(True)
         key_row.addWidget(self.key_label, 1)
         self.key_btn = QtWidgets.QPushButton()
-        self.key_btn.clicked.connect(lambda *_: self.ask_key())
+        self.key_btn.clicked.connect(lambda *_: self.toggle_key_editor())
         key_row.addWidget(self.key_btn)
         col.addLayout(key_row)
+        # Inline key editor (a separate dialog would close the popover)
+        self.key_editor = QtWidgets.QWidget()
+        kel = QtWidgets.QHBoxLayout(self.key_editor)
+        kel.setContentsMargins(0, 0, 0, 0)
+        self.key_field = QtWidgets.QLineEdit()
+        self.key_field.setEchoMode(qe(QtWidgets.QLineEdit, "EchoMode", "Password"))
+        self.key_field.setMaxLength(120)
+        self.key_field.returnPressed.connect(self.save_key)
+        self.key_save = QtWidgets.QPushButton(t("key.save"))
+        self.key_save.clicked.connect(lambda *_: self.save_key())
+        kel.addWidget(self.key_field, 1)
+        kel.addWidget(self.key_save)
+        self.key_editor.hide()
+        col.addWidget(self.key_editor)
 
         # Actions
         col.addWidget(self._separator())
@@ -641,15 +679,22 @@ class ControlWindow(_QWidget):
             self.tag_input.clear()
             self.ctrl.add_tag(clean, self.period())
 
-    def ask_key(self):
-        provider = "Pixabay" if self.ctrl.state.get("mode") == "pixabay" else "Wallhaven"
-        text, ok = QtWidgets.QInputDialog.getText(
-            self, t("key.dialogTitle", provider), t("key.dialogLabel", provider),
-            qe(QtWidgets.QLineEdit, "EchoMode", "Password"),
-        )
-        key = str(text or "").strip()
-        if ok and key:
-            self.ctrl.set_key(self.ctrl.state.get("mode", "wallhaven"), key)
+    def toggle_key_editor(self):
+        self.ctrl.key_saved = ""
+        self.editing_key = not self.editing_key
+        if not self.editing_key:
+            self.key_field.clear()
+        self.render()
+        if self.editing_key:
+            self.key_field.setFocus()
+
+    def save_key(self):
+        key = self.key_field.text().strip()
+        if not key or self.ctrl.busy:
+            return
+        self.key_field.clear()
+        self.editing_key = False
+        self.ctrl.set_key(self.ctrl.state.get("mode", "wallhaven"), key)
 
     def _backend_chosen(self, index):
         value = self.backend_combo.itemData(index)
@@ -686,14 +731,105 @@ class ControlWindow(_QWidget):
         self._thumbs[key] = icon
         return icon
 
+    # ---- popover behaviour
+    def set_popover(self, enabled):
+        """Frameless popover next to the tray icon, or a regular window."""
+        self.popover = bool(enabled)
+        WT = lambda n: qe(QtCore.Qt, "WindowType", n)
+        if self.popover and not self.wayland:
+            # X11: a real popup closes itself on any click outside it
+            flags = WT("Popup") | WT("FramelessWindowHint")
+        elif self.popover:
+            # Wayland: clients cannot position windows or grab the pointer, so use a
+            # fixed-size frameless tool window (tiling compositors float it) and hide
+            # it when it loses focus.
+            flags = WT("Tool") | WT("FramelessWindowHint") | WT("WindowStaysOnTopHint")
+        else:
+            flags = WT("Window")
+        self.setWindowFlags(flags)
+        translucent = self.popover and self.wayland
+        self.setAttribute(qe(QtCore.Qt, "WidgetAttribute", "WA_TranslucentBackground"), translucent)
+        if self.popover:
+            radius = 12 if translucent else 0
+            self.frame.setStyleSheet(
+                "#popoverFrame { background: palette(window); border: 1px solid palette(mid);"
+                f" border-radius: {radius}px; }}"
+            )
+        else:
+            self.frame.setStyleSheet("")
+            self.setMinimumSize(360, 400)
+            self.setMaximumSize(16777215, 16777215)
+            self.resize(480, 760)
+        self.close_btn.setVisible(self.popover)
+
+    def place(self, anchor=None):
+        """Size the popover and put it next to the tray icon (or the cursor)."""
+        app = QtGui.QGuiApplication
+        if isinstance(anchor, QtCore.QRect) and anchor.isValid() and not anchor.isEmpty():
+            pos = anchor.center()
+        elif isinstance(anchor, QtCore.QPoint):
+            pos = anchor
+        else:
+            pos = QtGui.QCursor.pos()
+        screen = (None if self.wayland else app.screenAt(pos)) or app.primaryScreen()
+        avail, full = screen.availableGeometry(), screen.geometry()
+        m = self.POPOVER_MARGIN
+        w = min(self.POPOVER_WIDTH, avail.width() - 2 * m)
+        h = min(self.POPOVER_MAX_HEIGHT, avail.height() - 2 * m)
+        self.setFixedSize(w, h)
+        if self.wayland:
+            return  # the compositor decides where windows go
+
+        def clamp(v, lo, hi):
+            return max(lo, min(v, hi))
+
+        x_min, x_max = avail.left() + m, avail.right() - w - m + 1
+        y_min, y_max = avail.top() + m, avail.bottom() - h - m + 1
+        if avail.left() > full.left() and pos.x() < avail.left() + 48:
+            x, y = x_min, clamp(pos.y() - h // 2, y_min, y_max)      # panel on the left
+        elif avail.right() < full.right() and pos.x() > avail.right() - 48:
+            x, y = x_max, clamp(pos.y() - h // 2, y_min, y_max)      # panel on the right
+        else:
+            x = clamp(pos.x() - w // 2, x_min, x_max)
+            y = y_min if pos.y() < avail.center().y() else y_max      # panel at top / bottom
+        self.move(x, y)
+
+    def recently_hidden(self):
+        return time.monotonic() - self.last_hidden < 0.35
+
+    def _autohide(self):
+        if (self.popover and self.isVisible() and not self.isActiveWindow()
+                and QtWidgets.QApplication.activePopupWidget() is None
+                and QtWidgets.QApplication.activeModalWidget() is None):
+            self.hide()
+
+    def changeEvent(self, event):
+        if (self.popover and event.type() == qe(QtCore.QEvent, "Type", "ActivationChange")
+                and not self.isActiveWindow()):
+            QtCore.QTimer.singleShot(150, self._autohide)
+        super().changeEvent(event)
+
+    def keyPressEvent(self, event):
+        if self.popover and event.key() == qe(QtCore.Qt, "Key", "Key_Escape"):
+            self.hide()
+            return
+        super().keyPressEvent(event)
+
     def showEvent(self, event):
         self.selected_period = None
         self.render()
         super().showEvent(event)
 
+    def hideEvent(self, event):
+        self.last_hidden = time.monotonic()
+        if self.editing_key:
+            self.editing_key = False
+            self.key_field.clear()
+        super().hideEvent(event)
+
     def closeEvent(self, event):
         event.ignore()
-        if self.minimize_on_close:
+        if self.minimize_on_close and not self.popover:
             self.showMinimized()
         else:
             self.hide()
@@ -726,7 +862,14 @@ class ControlWindow(_QWidget):
             self.key_label.setText(t("key.statusSet", provider))
         else:
             self.key_label.setText(t("key.statusRequired") if mode == "pixabay" else t("key.statusOptional"))
-        self.key_btn.setText(t("key.changeBtn") if has_key else t("key.setBtn"))
+        need_key = mode == "pixabay" and not has_key
+        self.key_editor.setVisible(self.editing_key or need_key)
+        self.key_btn.setVisible(not need_key)
+        self.key_btn.setText(t("key.cancelBtn") if self.editing_key
+                             else (t("key.changeBtn") if has_key else t("key.setBtn")))
+        self.key_field.setPlaceholderText(t("key.placeholderPixabay") if mode == "pixabay"
+                                          else t("key.placeholderWallhaven"))
+        self.key_save.setEnabled(not busy)
 
         for b in (self.prev_btn, self.next_btn, self.shuffle_btn):
             b.setEnabled(not busy)
@@ -837,6 +980,7 @@ class Controller:
         self.status_proc.finished.connect(lambda *_: self._on_status_finished())
 
         self.window = ControlWindow(self)
+        self.window.set_popover(True)
 
         self.tray = QtWidgets.QSystemTrayIcon(make_icon())
         self.tray.activated.connect(self._on_tray_activated)
@@ -890,6 +1034,7 @@ class Controller:
                 self.show_window()
         elif self._tray_wait >= 20:
             self._tray_timer.stop()
+            self.window.set_popover(False)
             self.window.minimize_on_close = True
             self.window.hint_label.show()
             self.show_window()
@@ -985,24 +1130,34 @@ class Controller:
 
     def _on_tray_activated(self, reason):
         if reason == qe(QtWidgets.QSystemTrayIcon, "ActivationReason", "Trigger"):
-            self.toggle_window()
+            geo = self.tray.geometry()  # only known on X11 (XEmbed) trays
+            self.toggle_window(geo if geo.isValid() and not geo.isEmpty() else None)
         elif reason == qe(QtWidgets.QSystemTrayIcon, "ActivationReason", "MiddleClick"):
             self.shuffle()
 
     # ---- window
-    def show_window(self):
+    def show_window(self, anchor=None):
         self.refresh()
-        self.window.showNormal()
-        self.window.raise_()
-        self.window.activateWindow()
-
-    def toggle_window(self):
-        if self.window.isVisible() and not self.window.isMinimized():
-            self.window.hide()
+        w = self.window
+        if w.popover:
+            w.place(anchor)
+            w.show()
         else:
-            self.show_window()
+            w.showNormal()
+        w.raise_()
+        w.activateWindow()
+
+    def toggle_window(self, anchor=None):
+        w = self.window
+        if w.isVisible() and not w.isMinimized():
+            w.hide()
+        elif not (w.popover and w.recently_hidden()):
+            # (a click on the tray icon has just closed the popover: don't reopen it)
+            self.show_window(anchor)
 
     def quit(self):
+        for proc in (self.proc, self.status_proc):
+            proc.blockSignals(True)  # no callbacks into a half torn-down app
         self.server.close()
         self.tray.hide()
         self.app.quit()

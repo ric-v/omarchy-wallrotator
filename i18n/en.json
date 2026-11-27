@@ -91,7 +91,7 @@
   "tray.recent": "Recent wallpapers",
   "tray.autostart": "Start on login",
   "tray.shuffleToggle": "Shuffle tags",
-  "tray.noTray": "No system tray was found. On GNOME, install the \"AppIndicator and KStatusNotifierItem Support\" extension. The window will stay open instead.",
+  "tray.noTray": "No system tray was found. On GNOME, install the \"AppIndicator and KStatusNotifierItem Support\" extension. Until then this opens as a normal window.",
   "tray.errorTitle": "Wallpaper Rotator",
   "section.desktop": "DESKTOP",
   "desktop.summary": "Desktop: %1 · Live wallpapers: %2",
@@ -102,6 +102,5 @@
   "live.mpvpaper": "mpvpaper",
   "live.xwinwrap": "xwinwrap + mpv",
   "live.frame": "still frame only (install mpvpaper or xwinwrap + mpv)",
-  "key.dialogTitle": "%1 API key",
-  "key.dialogLabel": "Paste your %1 API key / token:"
+  "tray.close": "Close"
 }
